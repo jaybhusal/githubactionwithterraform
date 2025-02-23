@@ -1,0 +1,75 @@
+name: Deploy ECS Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: "ECS Service Name"
+        required: true
+        type: string
+      environment:
+        description: "Deployment Environment (e.g., dev, staging, prod)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: my-ecs-cluster
+
+jobs:
+  deploy:
+    name: Deploy ECS Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set Environment Variables
+        run: |
+          echo "SERVICE_NAME=${{ github.event.inputs.service_name }}" >> $GITHUB_ENV
+          echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          echo "TASK_FAMILY=${{ github.event.inputs.service_name }}-task" >> $GITHUB_ENV
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        continue-on-error: true
+
+      - name: Check ECS Deployment Status
+        id: check-deployment
+        run: |
+          STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER --services $SERVICE_NAME --query "services[0].deployments[?status=='PRIMARY'].rolloutState" --output text)
+          if [[ "$STATUS" == "FAILED" || "$STATUS" == "INACTIVE" ]]; then
+            echo "Deployment failed. Rolling back..."
+            echo "ROLLBACK=true" >> $GITHUB_ENV
+          else
+            echo "Deployment successful."
+          fi
+
+      - name: Rollback on Failure
+        if: env.ROLLBACK == 'true'
+        run: |
+          echo "Fetching previous task definition..."
+          PREVIOUS_TASK=$(aws ecs describe-task-definition --task-definition $TASK_FAMILY --query "taskDefinition.taskDefinitionArn" --output text)
+          
+          echo "Rolling back to previous task definition: $PREVIOUS_TASK"
+          aws ecs update-service --cluster $ECS_CLUSTER --service $SERVICE_NAME --task-definition $PREVIOUS_TASK
+          
+          echo "Rollback complete."
